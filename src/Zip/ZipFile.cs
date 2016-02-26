@@ -1,4 +1,4 @@
-// ZipFile.cs
+﻿// ZipFile.cs
 //
 // Copyright (C) 2001 Mike Krueger
 // Copyright (C) 2004 John Reilly
@@ -41,7 +41,6 @@
 //	2009-12-22	Z-1649	Added AES support
 //	2010-03-02	Z-1650	Fixed updating ODT archives in memory. Exposed exceptions in updating.
 //	2010-05-25	Z-1663	Fixed exception when testing local header compressed size of -1
-//	2012-11-29	Z-1684	Fixed ZipFile.Add(string fileName, string entryName) losing the file TimeStamp
 
 using System;
 using System.Collections;
@@ -1023,7 +1022,7 @@ namespace ICSharpCode.SharpZipLib.Zip
 					throw new ZipException(string.Format("Wrong local header signature @{0:X}", offsetOfFirstEntry + entry.Offset));
 				}
 
-				short extractVersion = ( short ) (ReadLEUshort() & 0x00ff);
+				short extractVersion = ( short )ReadLEUshort();
 				short localFlags = ( short )ReadLEUshort();
 				short compressionMethod = ( short )ReadLEUshort();
 				short fileTime = ( short )ReadLEUshort();
@@ -1257,7 +1256,13 @@ namespace ICSharpCode.SharpZipLib.Zip
 								entry.Size, size));
 					}
 
-					if (compressedSize != entry.CompressedSize &&
+                    bool isStored = entry.CompressionMethod == CompressionMethod.Stored;
+
+                    if (isStored) {
+                        compressedSize = entry.CompressedSize; //Compressed size on store!!!
+                    } else
+
+					if (compressedSize != entry.CompressedSize && 
 						compressedSize != 0xFFFFFFFF && compressedSize != -1) {
 						throw new ZipException(
 							string.Format("Compressed size mismatch between central header({0}) and local header({1})",
@@ -1648,7 +1653,7 @@ namespace ICSharpCode.SharpZipLib.Zip
 			}
 			
 			CheckUpdating();
-			AddUpdate(new ZipUpdate(fileName, EntryFactory.MakeFileEntry(fileName, entryName, true)));
+			AddUpdate(new ZipUpdate(fileName, EntryFactory.MakeFileEntry(entryName)));
 		}
 
 
@@ -3042,7 +3047,7 @@ namespace ICSharpCode.SharpZipLib.Zip
 			if ( data2 < 0 ) {
 				throw new EndOfStreamException("End of stream");
 			}
-
+            
 
 			return unchecked((ushort)((ushort)data1 | (ushort)(data2 << 8)));
 		}
@@ -3099,22 +3104,133 @@ namespace ICSharpCode.SharpZipLib.Zip
 			if (baseStream_.CanSeek == false) {
 				throw new ZipException("ZipFile stream must be seekable");
 			}
-			
-			long locatedEndOfCentralDir = LocateBlockWithSignature(ZipConstants.EndOfCentralDirectorySignature,
-				baseStream_.Length, ZipConstants.EndOfCentralRecordBaseSize, 0xffff);
-			
-			if (locatedEndOfCentralDir < 0) {
-				throw new ZipException("Cannot find central directory");
-			}
 
-			// Read end of central directory record
-			ushort thisDiskNumber           = ReadLEUshort();
-			ushort startCentralDirDisk      = ReadLEUshort();
-			ulong entriesForThisDisk        = ReadLEUshort();
-			ulong entriesForWholeCentralDir = ReadLEUshort();
-			ulong centralDirSize            = ReadLEUint();
-			long offsetOfCentralDir         = ReadLEUint();
-			uint commentSize                = ReadLEUshort();
+            /* Check If the bit at offset 3 (0x08) of the general-purpose flags field is set, then the CRC-32 
+             * and file sizes are not known when the header is written. The fields in the local header are filled 
+             * with zero, and the CRC-32 and size are appended in a 12-byte structure (optionally preceded by a 
+             * 4-byte signature) immediately after the compressed data:
+
+                Data descriptor
+                Offset	Bytes	Description[25]
+                 0	    0/4	    Optional data descriptor signature = 0x08074b50
+                 0/4	4	    CRC-32
+                 4/8	4	    Compressed size
+                 8/12	4	    Uncompressed size
+             */ 
+
+            //First we need to read headers
+            long locatedZipLocalHeader = LocateBlockWithSignature(
+                ZipConstants.LocalHeaderSignature,
+                10,
+                10,
+                10 );
+
+            ushort 
+                versionNeededToExtract = ReadLEUshort(),
+                generalPurposeBitFlags = ReadLEUshort(),
+                compressionMethod = ReadLEUshort();
+
+            long locatedEndOfCentralDir = LocateBlockWithSignature(
+                   ZipConstants.EndOfCentralDirectorySignature,
+                   baseStream_.Length,
+                   ZipConstants.EndOfCentralRecordBaseSize,
+                   0xffff
+               );
+
+            //Check Version
+
+            //Variables
+            ushort thisDiskNumber           = 0;
+            ushort startCentralDirDisk      = 0;
+            ulong entriesForThisDisk        = 0;
+            ulong entriesForWholeCentralDir = 0;
+            ulong centralDirSize            = 0;
+            long offsetOfCentralDir         = 0;
+            uint commentSize                = 0;           
+
+
+            //Check General purpose bit
+            if (( (ushort)GeneralBitFlags.Descriptor & generalPurposeBitFlags ) == (ushort)GeneralBitFlags.Descriptor) {
+                //the file entry is at the end
+                long locatedDescriptorHeader = LocateBlockWithSignature( ZipConstants.DataDescriptorSignature, baseStream_.Length, 4, 0xffff );
+
+                if (locatedDescriptorHeader < 0)
+                    throw new ZipException( "Invalid Zip File. Cannot find any entry header (or footer)" );
+
+                uint crc               = ReadLEUint();
+                long csize             = (long)ReadLEUint();
+                long size              = (long)ReadLEUint();
+
+                if (locatedEndOfCentralDir < 0) {
+                    //if there is no central dir header it is assumed that zip file contains only 1 file (maybe not? [TODO])
+                    #region |:.Process single entry.:|
+                    entries_ = new ZipEntry[1];
+                    //offsetOfFirstEntry = 
+                    //return to local file header
+                    LocateBlockWithSignature( ZipConstants.LocalHeaderSignature, 10, 10, 10 );
+                    //Skip till file name length
+                    baseStream_.Position += ( 2 + 2 + 2 + 2 + 2 + 4 + 4 + 4 );
+
+                    int nameLen            = ReadLEUshort();
+                    int extraLen           = ReadLEUshort();
+
+                    byte[] buffer = new byte[nameLen];
+                    byte[] extra = new byte[0];
+
+                    StreamUtils.ReadFully( baseStream_, buffer, 0, nameLen );
+                    string name = ZipConstants.ConvertToStringExt( 0, buffer, nameLen );
+                    if (extraLen > 0) {
+                        extra = new byte[extraLen];
+                        StreamUtils.ReadFully( baseStream_, extra );                        
+                    }
+
+                    //long offset = baseStream_.Position;
+
+                    ZipEntry entry = new ZipEntry( name, versionNeededToExtract, 0, (CompressionMethod)compressionMethod );
+                    entry.Crc = crc & 0xffffffffL;
+                    entry.Size = size & 0xffffffffL;
+                    entry.CompressedSize = csize & 0xffffffffL;
+                    entry.Flags = 0;
+                    entry.DosTime = (uint)0;
+                    entry.ZipFileIndex = (long)0;
+                    entry.Offset = locatedZipLocalHeader - 4; //in this case where there is no central directory present, file offset is locatedZipLocalHeader - 4 (length of header)
+                    entry.ExtraData = extra;
+                    //entry.ExternalFileAttributes = (int)externalAttributes;
+
+                    entry.ProcessExtraData( false );
+                    entries_[0] = entry;
+                    return;
+
+                    #endregion                    
+                } else {
+                    //throw new NotSupportedException( "This operation is not supported! TODO: #1" );
+                    baseStream_.Seek( locatedEndOfCentralDir, SeekOrigin.Begin );
+                    thisDiskNumber = ReadLEUshort();
+                    startCentralDirDisk = ReadLEUshort();
+                    entriesForThisDisk = ReadLEUshort();
+                    entriesForWholeCentralDir = ReadLEUshort();
+                    centralDirSize = ReadLEUint();
+                    offsetOfCentralDir = ReadLEUint();
+                    commentSize = ReadLEUshort();
+                }
+            } else {
+                #region |:.Normal Operation.:|
+
+                if (locatedEndOfCentralDir < 0) {
+                    throw new ZipException( "Cannot find central directory" );
+                }
+
+                // Read end of central directory record
+                thisDiskNumber = ReadLEUshort();
+                startCentralDirDisk = ReadLEUshort();
+                entriesForThisDisk = ReadLEUshort();
+                entriesForWholeCentralDir = ReadLEUshort();
+                centralDirSize = ReadLEUint();
+                offsetOfCentralDir = ReadLEUint();
+                commentSize = ReadLEUshort();
+                #endregion               
+            }
+            		
 			
 			if ( commentSize > 0 ) {
 				byte[] comment = new byte[commentSize]; 
@@ -3135,40 +3251,42 @@ namespace ICSharpCode.SharpZipLib.Zip
 				(entriesForWholeCentralDir == 0xffff) ||
 				(centralDirSize == 0xffffffff) ||
 				(offsetOfCentralDir == 0xffffffff) ) {
-				isZip64 = true;
+                #region |:.Check if zip64 header information is required..:|
+                isZip64 = true;
 
-				long offset = LocateBlockWithSignature(ZipConstants.Zip64CentralDirLocatorSignature, locatedEndOfCentralDir, 0, 0x1000);
-				if ( offset < 0 ) {
-					throw new ZipException("Cannot find Zip64 locator");
-				}
+                long offset = LocateBlockWithSignature( ZipConstants.Zip64CentralDirLocatorSignature, locatedEndOfCentralDir, 0, 0x1000 );
+                if (offset < 0) {
+                    throw new ZipException( "Cannot find Zip64 locator" );
+                }
 
-				// number of the disk with the start of the zip64 end of central directory 4 bytes 
-				// relative offset of the zip64 end of central directory record 8 bytes 
-				// total number of disks 4 bytes 
-				ReadLEUint(); // startDisk64 is not currently used
-				ulong offset64 = ReadLEUlong();
-				uint totalDisks = ReadLEUint();
+                // number of the disk with the start of the zip64 end of central directory 4 bytes 
+                // relative offset of the zip64 end of central directory record 8 bytes 
+                // total number of disks 4 bytes 
+                ReadLEUint(); // startDisk64 is not currently used
+                ulong offset64 = ReadLEUlong();
+                uint totalDisks = ReadLEUint();
 
-				baseStream_.Position = (long)offset64;
-				long sig64 = ReadLEUint();
+                baseStream_.Position = (long)offset64;
+                long sig64 = ReadLEUint();
 
-				if ( sig64 != ZipConstants.Zip64CentralFileHeaderSignature ) {
-					throw new ZipException(string.Format("Invalid Zip64 Central directory signature at {0:X}", offset64));
-				}
+                if (sig64 != ZipConstants.Zip64CentralFileHeaderSignature) {
+                    throw new ZipException( string.Format( "Invalid Zip64 Central directory signature at {0:X}", offset64 ) );
+                }
 
-				// NOTE: Record size = SizeOfFixedFields + SizeOfVariableData - 12.
-				ulong recordSize = ReadLEUlong();
-				int versionMadeBy = ReadLEUshort();
-				int versionToExtract = ReadLEUshort();
-				uint thisDisk = ReadLEUint();
-				uint centralDirDisk = ReadLEUint();
-				entriesForThisDisk = ReadLEUlong();
-				entriesForWholeCentralDir = ReadLEUlong();
-				centralDirSize = ReadLEUlong();
-				offsetOfCentralDir = (long)ReadLEUlong();
+                // NOTE: Record size = SizeOfFixedFields + SizeOfVariableData - 12.
+                ulong recordSize = ReadLEUlong();
+                int versionMadeBy = ReadLEUshort();
+                int versionToExtract = ReadLEUshort();
+                uint thisDisk = ReadLEUint();
+                uint centralDirDisk = ReadLEUint();
+                entriesForThisDisk = ReadLEUlong();
+                entriesForWholeCentralDir = ReadLEUlong();
+                centralDirSize = ReadLEUlong();
+                offsetOfCentralDir = (long)ReadLEUlong();
 
-				// NOTE: zip64 extensible data sector (variable size) is ignored.
-			}
+                // NOTE: zip64 extensible data sector (variable size) is ignored.
+                #endregion
+            }
 			
 			entries_ = new ZipEntry[entriesForThisDisk];
 			
@@ -4282,7 +4400,7 @@ namespace ICSharpCode.SharpZipLib.Zip
 		/// </summary>
 		/// <param name="stream">The current stream.</param>
 		/// <returns>Returns a stream suitable for direct updating.</returns>
-		/// <remarks>If the <paramref name="stream"/> is not null this is used as is.</remarks>
+		/// <remarks>If the <paramref name="current"/> stream is not null this is used as is.</remarks>
 		public override Stream OpenForDirectUpdate(Stream stream)
 		{
 			Stream result;
